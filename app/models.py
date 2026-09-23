@@ -15,6 +15,43 @@ ResolutionSide = Literal["base", "left", "right"]
 # Side a merged leaf ultimately came from.
 ProvenanceSource = Literal["base", "left", "right", "merged"]
 
+# Modes a checkRules entry can constrain an object scope with.
+CheckMode = Literal["all_or_none", "at_most_one"]
+
+
+class CheckRule(BaseModel):
+    """One regression constraint over the direct fields of object scopes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the object whose direct fields are "
+            "constrained. A single '*' token matches one single level of "
+            "object keys (it never expands into arrays or across multiple "
+            "levels). Literal tokens follow RFC 6901 (object member names "
+            "and array indices). Concrete locations that do not resolve to "
+            "an object are not scopes and produce no violations."
+        ),
+    )
+    fields: list[str] = Field(
+        ...,
+        description=(
+            "Names of at least two distinct direct child fields of the "
+            "scoped object. Membership is what counts: an existing key is "
+            "present even when its value is null; an absent key is not."
+        ),
+    )
+    mode: CheckMode = Field(
+        ...,
+        description=(
+            "all_or_none: either every listed field is present or none is "
+            "(some but not all violates); at_most_one: at most one listed "
+            "field may be present (two or more violate)."
+        ),
+    )
+
 
 class ConflictResolution(BaseModel):
     """One adjudication: which side wins at a reported conflict."""
@@ -136,6 +173,26 @@ class MergeRequest(BaseModel):
             "shape is unchanged and no 'patch' key is emitted."
         ),
     )
+    check_rules: Optional[list[CheckRule]] = Field(
+        default=None,
+        alias="checkRules",
+        description=(
+            "Optional constraint regression checks evaluated after the "
+            "ordinary merge (including conflictResolutions adjudication). "
+            "Each rule constrains the direct fields of the object scopes "
+            "its 'scope' pointer expands to, in 'base' and in the final "
+            "'merged' alike; the response 'violations' array lists only "
+            "violations that are new in merged (a violation already "
+            "present in base that persists, or a scope deleted from "
+            "merged, is not reported). Entries carry the rule index, the "
+            "concrete scope pointer and the listed fields actually "
+            "present in merged, sorted by rule index then scope pointer. "
+            "When the key is omitted the response shape is unchanged and "
+            "no 'violations' key is emitted. Malformed scope pointers and "
+            "invalid field lists (fewer than two, duplicated, or empty "
+            "names) are rejected with HTTP 400."
+        ),
+    )
 
 
 class PatchOperation(BaseModel):
@@ -230,6 +287,36 @@ class ProvenanceEntry(BaseModel):
     )
 
 
+class Violation(BaseModel):
+    """One checkRules violation newly present in the merged document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: int = Field(
+        ...,
+        description=(
+            "Zero-based index of the checkRules entry this violation "
+            "belongs to."
+        ),
+    )
+    scope: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the concrete object scope in "
+            "'merged' that violates the rule (wildcard tokens of the rule "
+            "scope are replaced by the actual object key they matched)."
+        ),
+    )
+    fields: list[str] = Field(
+        ...,
+        description=(
+            "The rule's listed fields that are actually present (sorted) "
+            "in the violating scope of 'merged'; a key holding null counts "
+            "as present."
+        ),
+    )
+
+
 class MergeResponse(BaseModel):
     merged: JsonValue
     conflicts: list[Conflict]
@@ -251,5 +338,16 @@ class MergeResponse(BaseModel):
             "wholesale, and JSON Pointer tokens follow RFC 6901 escaping. "
             "Absent entirely from the response when the patch was not "
             "requested."
+        ),
+    )
+    violations: Optional[list[Violation]] = Field(
+        default=None,
+        description=(
+            "Present only when the request carried checkRules. One entry "
+            "per rule violation that is newly present in the adjudicated "
+            "'merged' document and was not already present in 'base' at "
+            "the same concrete scope; entries are sorted by rule index "
+            "then scope pointer. Absent entirely from the response when "
+            "checkRules was omitted."
         ),
     )

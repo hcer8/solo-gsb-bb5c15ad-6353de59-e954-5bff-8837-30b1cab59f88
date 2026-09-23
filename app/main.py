@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from .checks import evaluate_check_rules, parse_rules, render_scope
 from .config import settings
 from .merger import Merger, parse_pointer
 from .middleware import RequestSizeLimitMiddleware
@@ -13,6 +14,7 @@ from .models import (
     MergeRequest,
     MergeResponse,
     ProvenanceEntry,
+    Violation,
 )
 from .patch import build_json_patch
 
@@ -46,9 +48,21 @@ app = FastAPI(
         "differences are emitted recursively, arrays are replaced "
         "wholesale, and reference tokens follow RFC 6901 escaping. "
         "Without redaction the response conflicts always keep the original "
-        "three-way values."
+        "three-way values. With 'checkRules' the response additionally "
+        "carries a 'violations' array: each rule constrains the direct "
+        "fields of the object scopes its RFC 6901 'scope' pointer expands "
+        "to (a '*' token matches one single level of object keys) with "
+        "mode 'all_or_none' (either every listed field is present or none "
+        "is) or 'at_most_one' (at most one listed field may be present; "
+        "an existing key counts, null included). Rules are evaluated "
+        "against 'base' and against the final, adjudicated 'merged'; only "
+        "violations newly present in merged are reported - a violation "
+        "already present in base that persists, or a scope deleted from "
+        "merged, is not reported. Entries carry the rule index, the "
+        "concrete scope pointer and the listed fields actually present, "
+        "sorted by rule index then scope pointer."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -114,6 +128,48 @@ async def merge(request: MergeRequest):
                 detail=f"duplicate redactPaths entry for pointer {pointer!r}",
             )
         redact_seen.add(tokens)
+
+    # Check rules must be well-formed: a valid RFC 6901 scope pointer and
+    # at least two distinct, non-empty direct field names. Like the other
+    # toggles, an explicitly supplied list enables the "violations" key
+    # (even when empty); omission leaves the legacy envelope untouched.
+    rules = request.check_rules
+    rules_enabled = "check_rules" in request.model_fields_set and rules is not None
+    if rules is not None:
+        for index, rule in enumerate(rules):
+            try:
+                parse_pointer(rule.scope)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"invalid checkRules[{index}] scope pointer "
+                        f"{rule.scope!r}: {exc}"
+                    ),
+                ) from exc
+            if len(rule.fields) < 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"checkRules[{index}] must list at least two fields"
+                    ),
+                )
+            if len(set(rule.fields)) != len(rule.fields):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"checkRules[{index}] fields must not contain "
+                        "duplicates"
+                    ),
+                )
+            if any(not field for field in rule.fields):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"checkRules[{index}] field names must be "
+                        "non-empty strings"
+                    ),
+                )
 
     try:
         merger = Merger(
@@ -181,8 +237,8 @@ async def merge(request: MergeRequest):
 
     # Serialize directly: with the optional toggles off the response must be
     # byte-for-byte the old two-key envelope (no "provenance": null /
-    # "patch": null), while an enabled request always includes the matching
-    # key, even when its array is empty.
+    # "patch": null / "violations": null), while an enabled request always
+    # includes the matching key, even when its array is empty.
     body: dict = {
         "merged": merged,
         "conflicts": [c.model_dump() for c in conflicts],
@@ -191,4 +247,17 @@ async def merge(request: MergeRequest):
         body["provenance"] = [entry.model_dump() for entry in provenance]
     if request.include_patch:
         body["patch"] = build_json_patch(request.base, merged)
+    if rules_enabled:
+        # Pure post-processing: the merge above (protection, adjudication
+        # included) is untouched; only new violations of the final merged
+        # document are reported.
+        violations = evaluate_check_rules(request.base, merged, parse_rules(rules))
+        body["violations"] = [
+            Violation(
+                rule=v.rule,
+                scope=render_scope(v.scope),
+                fields=v.fields,
+            ).model_dump()
+            for v in violations
+        ]
     return JSONResponse(body)

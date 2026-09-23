@@ -337,6 +337,83 @@ curl -s -X POST http://localhost:8000/merge \
 {"op": "remove", "path": "/old"}
 ```
 
+### 约束回归检查（checkRules）
+
+有些配置要求一组字段**成组出现**或**互斥出现**。请求可携带可选的 `checkRules`
+（也接受别名 `check_rules`），在**合并、保护与裁决全部完成之后**对结果做一次纯只读的
+约束回归检查——它不改变 `merged` 与 `conflicts`，只在响应中**新增** `violations`
+数组；不带规则时响应格式完全不变（连键都不存在，与 `includeProvenance` /
+`includePatch` 一致）；显式传 `"checkRules": []` 时返回 `"violations": []`。
+
+每条规则含三个字段：
+
+```json
+{
+  "scope": "/servers/*/feature",
+  "fields": ["tlsCert", "tlsKey"],
+  "mode": "all_or_none"
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `scope` | [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901.html) 指针，定位受约束的**对象**（作用域）。单段 `*` **仅匹配单层对象键**：不进入数组、不跨多层。字面值段按 RFC 6901 解析（对象成员名或数组下标）。具体位置解析不到、或解析结果不是对象时，不产生作用域、也不报错（根作用域用空字符串 `""`）。 |
+| `fields` | 至少 **2 个不重复**的直接子字段名。按“**成员是否存在**”计数：键存在即计入，**值为 `null` 也算存在**；键不存在才不计。 |
+| `mode` | `all_or_none`：要么全有、要么全无（只存在一部分即违规）；`at_most_one`：最多存在一个（存在两个及以上即违规）。 |
+
+**回归语义**：每条规则分别在请求 `base` 与裁决后的 `merged` 中展开对象作用域，
+按规则模式与**实际作用域指针对齐**比较——只返回 `merged` 中**新出现**的违规：
+
+- 作用域在 base 中已违规且 merged 仍违规（无论存在的字段集合是否变化）→ **不报**；
+- 作用域（对象本身）被合并删除、或在 merged 中不再是对象 → **不报**；
+- 作用域是 merged 中新增的对象子树 → 按 merged 实际存在的字段判定并报告；
+- base 合规、merged 违规 → 报告，`fields` 为 merged 中**实际存在**的规则字段。
+
+`violations` 按下标、再按作用域指针升序排列，每条记录含规则下标（从 0 开始）、
+具体作用域指针（规则中的 `*` 替换为实际匹配到的对象键；token 按 RFC 6901 转义，
+如 `~` → `~0`、`/` → `~1`）与实际存在字段（升序）：
+
+```json
+{ "rule": 0, "scope": "/servers/s1/feature", "fields": ["tlsCert"] }
+```
+
+以下情况返回 **400**：`scope` 指针格式非法、`fields` 少于 2 个、含重复字段名、
+含空字段名（错误信息带规则下标，如 `checkRules[1]`）。`scope` / `fields` 类型不对、
+`mode` 取其他值或规则含多余字段时返回 **422**。
+
+示例（base 中 `/svc` 只有无关字段；left 单侧新增 `tlsCert`，触发
+`all_or_none` 回归）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"svc": {"port": 8080}},
+    "left":  {"svc": {"port": 8080, "tlsCert": "pem-data"}},
+    "right": {"svc": {"port": 8080}},
+    "checkRules": [
+      {"scope": "/svc", "fields": ["tlsCert", "tlsKey"], "mode": "all_or_none"}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": {"svc": {"port": 8080, "tlsCert": "pem-data"}},
+  "conflicts": [],
+  "violations": [
+    {"rule": 0, "scope": "/svc", "fields": ["tlsCert"]}
+  ]
+}
+```
+
+同样的半成组状态若在 `base` 中**已经存在**（原有违规持续存在），则 `violations`
+为空；合并把该对象作用域整个删除时也为空。检查基于**裁决后**的 `merged`：一个默认
+保留 base 的冲突若经 `conflictResolutions` 裁决后写入了触发约束的值，该违规同样会
+出现在 `violations` 中。该选项可与 `includeProvenance`、`includePatch` 同时开启。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -361,7 +438,10 @@ curl -s -X POST http://localhost:8000/merge \
 开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）；
 `includePatch`（也接受别名 `include_patch`）为布尔值，可省略（默认 `false`），
 开启后响应额外返回一组按顺序把 `base` 变成 `merged` 的 RFC 6902 `patch` 操作
-（见“JSON Patch”一节），可与 `includeProvenance` 同时开启。
+（见“JSON Patch”一节），可与 `includeProvenance` 同时开启；
+`checkRules`（也接受别名 `check_rules`）为约束回归检查规则数组，可省略（默认不带，
+响应不含 `violations` 键），携带时响应额外返回 `violations` 数组，列出仅在裁决后的
+`merged` 中新出现的约束违规（见“约束回归检查”一节），可与其他选项同时开启。
 
 请求：
 
@@ -549,6 +629,7 @@ app/
   main.py         FastAPI 路由（/health、/merge）
   merger.py       三方合并引擎（JSON Pointer、身份数组、冲突建模）
   patch.py        RFC 6902 JSON Patch 生成（对象递归、数组整体替换、token 转义）
+  checks.py       checkRules 约束回归检查（作用域展开、模式判定、base→merged 回归对比）
   middleware.py   请求体大小上限 ASGI 中间件
   config.py       环境变量配置与大小解析
   models.py       请求/响应 Pydantic 模型

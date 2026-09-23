@@ -1477,6 +1477,462 @@ def test_patch_operation_shape_is_validated_in_schema():
     assert response_schema["required"] == ["merged", "conflicts"]
 
 
+# --------------------------------------------------------------- checkRules
+
+
+def test_violations_absent_from_response_by_default():
+    response = client.post(
+        "/merge",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1}},
+    )
+    assert response.status_code == 200
+    # The legacy envelope is unchanged: no violations key at all.
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_violations_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {"a": 1}, "right": {},
+            "check_rules": [
+                {"scope": "", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "", "fields": ["a"]}
+    ]
+
+
+def test_empty_check_rules_emits_empty_violations_key():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "checkRules": [],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["violations"] == []
+    assert set(body.keys()) == {"merged", "conflicts", "violations"}
+
+
+def test_check_rules_do_not_change_merged_or_conflicts():
+    payload = {
+        "base": {"svc": {}},
+        "left": {"svc": {"a": 1}},
+        "right": {"svc": {}},
+    }
+    without = client.post("/merge", json=payload).json()
+    with_rules = client.post(
+        "/merge",
+        json={
+            **payload,
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    ).json()
+    assert with_rules["merged"] == without["merged"]
+    assert with_rules["conflicts"] == without["conflicts"]
+
+
+def test_all_or_none_violation_reported_with_present_fields():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {"x": 1}},
+            "left": {"svc": {"x": 1, "a": 1}},
+            "right": {"svc": {"x": 1}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/svc", "fields": ["a"]}
+    ]
+
+
+def test_all_or_none_all_present_is_compliant_including_nulls():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {}},
+            "left": {"svc": {"a": None, "b": None}},
+            "right": {"svc": {}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == []
+
+
+def test_null_value_counts_as_present():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {}},
+            "left": {"svc": {"a": None}},
+            "right": {"svc": {}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/svc", "fields": ["a"]}
+    ]
+
+
+def test_at_most_one_violation():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {}},
+            "left": {"svc": {"a": 1, "b": 2}},
+            "right": {"svc": {}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "at_most_one"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/svc", "fields": ["a", "b"]}
+    ]
+
+
+def test_pre_existing_violation_persisting_is_not_reported():
+    response = client.post(
+        "/merge",
+        json={
+            # Base already violates (only a); merged keeps violating while
+            # an unrelated field changes: no regression to report.
+            "base": {"svc": {"a": 1}},
+            "left": {"svc": {"a": 1, "z": 9}},
+            "right": {"svc": {"a": 1}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == []
+
+
+def test_scope_deleted_from_merged_is_not_reported():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {"a": 1}},
+            "left": {},
+            "right": {"svc": {"a": 1}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == []
+
+
+def test_scope_turned_into_scalar_is_not_reported():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"svc": {"a": 1}},
+            "left": {"svc": 5},
+            "right": {"svc": {"a": 1}},
+            "checkRules": [
+                {"scope": "/svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == []
+
+
+def test_wildcard_matches_single_object_level():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"services": {}},
+            "left": {"services": {"s1": {"a": 1}, "s2": {"c": 1}}},
+            "right": {"services": {}},
+            "checkRules": [
+                {
+                    "scope": "/services/*",
+                    "fields": ["a", "b"],
+                    "mode": "all_or_none",
+                }
+            ],
+        },
+    )
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/services/s1", "fields": ["a"]}
+    ]
+
+
+def test_wildcard_does_not_expand_into_arrays():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"arr": [{}]},
+            "left": {"arr": [{"a": 1, "b": 2}]},
+            "right": {"arr": [{}]},
+            "checkRules": [
+                {
+                    "scope": "/arr/*",
+                    "fields": ["a", "b"],
+                    "mode": "at_most_one",
+                }
+            ],
+        },
+    )
+    assert response.json()["violations"] == []
+
+
+def test_literal_array_index_resolves_a_scope():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"arr": [{}]},
+            "left": {"arr": [{"a": 1, "b": 2}]},
+            "right": {"arr": [{}]},
+            "checkRules": [
+                {
+                    "scope": "/arr/0",
+                    "fields": ["a", "b"],
+                    "mode": "at_most_one",
+                }
+            ],
+        },
+    )
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/arr/0", "fields": ["a", "b"]}
+    ]
+
+
+def test_violations_sorted_by_rule_index_then_pointer():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"s": {"a": {}, "m": {}, "z": {}}},
+            "left": {"s": {"a": {"a": 1}, "m": {"a": 1}, "z": {"a": 1}}},
+            "right": {"s": {"a": {}, "m": {}, "z": {}}},
+            "checkRules": [
+                {"scope": "/s/*", "fields": ["a", "b"], "mode": "all_or_none"},
+                {"scope": "/s/m", "fields": ["a", "b"], "mode": "all_or_none"},
+            ],
+        },
+    )
+    assert [(v["rule"], v["scope"]) for v in response.json()["violations"]] == [
+        (0, "/s/a"),
+        (0, "/s/m"),
+        (0, "/s/z"),
+        (1, "/s/m"),
+    ]
+
+
+def test_violations_evaluated_against_adjudicated_merged():
+    # Base has one of the pair (at_most_one compliant); right edits the
+    # whole object to include both. The delete-vs-modify conflict keeps
+    # base by default; adjudicating it to right writes both fields, which
+    # introduces the violation.
+    payload = {
+        "base": {"svc": {"a": 1}},
+        "left": {},
+        "right": {"svc": {"a": 1, "b": 2}},
+        "checkRules": [
+            {"scope": "/svc", "fields": ["a", "b"], "mode": "at_most_one"}
+        ],
+    }
+    default = client.post("/merge", json=payload).json()
+    assert default["merged"] == {"svc": {"a": 1}}
+    assert default["violations"] == []
+
+    adjudicated = client.post(
+        "/merge",
+        json={
+            **payload,
+            "conflictResolutions": [
+                {"pointer": "/svc", "resolution": "right"}
+            ],
+        },
+    ).json()
+    assert adjudicated["merged"] == {"svc": {"a": 1, "b": 2}}
+    assert adjudicated["violations"] == [
+        {"rule": 0, "scope": "/svc", "fields": ["a", "b"]}
+    ]
+
+
+def test_check_rules_work_alongside_provenance_and_patch():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"x": {}},
+            "left": {"x": {"a": 1}},
+            "right": {"x": {}},
+            "includeProvenance": True,
+            "includePatch": True,
+            "checkRules": [
+                {"scope": "/x", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "merged", "conflicts", "provenance", "patch", "violations",
+    }
+    assert body["violations"] == [
+        {"rule": 0, "scope": "/x", "fields": ["a"]}
+    ]
+    assert body["patch"][0]["path"] == "/x/a"
+
+
+def test_escaped_scope_pointer_is_rendered_with_rfc6901_escaping():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a/b": {}},
+            "left": {"a/b": {"x": 1}},
+            "right": {"a/b": {}},
+            "checkRules": [
+                {"scope": "/a~1b", "fields": ["x", "y"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.json()["violations"] == [
+        {"rule": 0, "scope": "/a~1b", "fields": ["x"]}
+    ]
+
+
+def test_invalid_check_rule_scope_pointer_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "svc", "fields": ["a", "b"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[0]" in response.json()["detail"]
+    assert "scope pointer" in response.json()["detail"]
+
+
+def test_second_rule_invalid_scope_pointer_returns_400_with_index():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/ok", "fields": ["a", "b"], "mode": "all_or_none"},
+                {"scope": "bad", "fields": ["a", "b"], "mode": "all_or_none"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[1]" in response.json()["detail"]
+
+
+def test_fewer_than_two_fields_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/x", "fields": ["a"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[0]" in response.json()["detail"]
+
+
+def test_duplicate_fields_return_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/x", "fields": ["a", "a"], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[0]" in response.json()["detail"]
+
+
+def test_empty_field_name_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/x", "fields": ["a", ""], "mode": "all_or_none"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[0]" in response.json()["detail"]
+
+
+def test_check_rule_type_errors_return_422():
+    for bad_rule in [
+        {"scope": 1, "fields": ["a", "b"], "mode": "all_or_none"},
+        {"scope": "/x", "fields": "ab", "mode": "all_or_none"},
+        {"scope": "/x", "fields": [1, 2], "mode": "all_or_none"},
+        {"scope": "/x", "fields": ["a", "b"], "mode": "weird"},
+    ]:
+        response = client.post(
+            "/merge",
+            json={
+                "base": {}, "left": {}, "right": {},
+                "checkRules": [bad_rule],
+            },
+        )
+        assert response.status_code == 422, bad_rule
+
+
+def test_check_rules_extra_property_returns_422():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {
+                    "scope": "/x",
+                    "fields": ["a", "b"],
+                    "mode": "all_or_none",
+                    "extra": 1,
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_check_rules_appear_in_openapi_schema():
+    schema = client.get("/openapi.json").json()
+    req_props = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "checkRules" in req_props
+    rule_schema = schema["components"]["schemas"]["CheckRule"]
+    assert rule_schema["required"] == ["scope", "fields", "mode"]
+    assert set(rule_schema["properties"]["mode"]["enum"]) == {
+        "all_or_none", "at_most_one",
+    }
+    response_schema = schema["components"]["schemas"]["MergeResponse"]
+    assert "violations" not in response_schema["required"]
+    assert "violations" in response_schema["properties"]
+    violation_schema = schema["components"]["schemas"]["Violation"]
+    assert violation_schema["required"] == ["rule", "scope", "fields"]
+
+
 # ------------------------------------------------------------- size limiting
 
 
