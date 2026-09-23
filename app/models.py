@@ -15,6 +15,71 @@ ResolutionSide = Literal["base", "left", "right"]
 # Side a merged leaf ultimately came from.
 ProvenanceSource = Literal["base", "left", "right", "merged"]
 
+# Coexistence modes enforced by a checkRules entry.
+CheckMode = Literal["all_or_none", "at_most_one"]
+
+
+class CheckRule(BaseModel):
+    """One coexistence constraint over direct child fields of object scopes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the object the rule is checked on. "
+            "A single '*' reference token matches one object key only (it "
+            "never matches array indices); a scope expands over every "
+            "concrete object it reaches in both 'base' and the final "
+            "'merged' document. The empty string targets the root document."
+        ),
+    )
+    fields: list[str] = Field(
+        ...,
+        description=(
+            "Direct child field names of each scope object; at least two "
+            "distinct names (fewer or repeated names are rejected with "
+            "HTTP 400). A field counts as present whenever the object "
+            "carries it, including a JSON null value."
+        ),
+    )
+    mode: CheckMode = Field(
+        ...,
+        description=(
+            "'all_or_none': either every named field is present or none is; "
+            "'at_most_one': at most one named field is present."
+        ),
+    )
+
+
+class Violation(BaseModel):
+    """One checkRules violation newly introduced by the merged document."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    rule_index: int = Field(
+        alias="ruleIndex",
+        ge=0,
+        description=(
+            "Zero-based index of the violated rule in the request "
+            "'checkRules' array."
+        ),
+    )
+    scope: str = Field(
+        ...,
+        description=(
+            "Concrete JSON Pointer (RFC 6901) of the object violating the "
+            "rule, after wildcard scopes are expanded."
+        ),
+    )
+    fields: list[str] = Field(
+        ...,
+        description=(
+            "The rule's named fields actually present at the scope, in the "
+            "rule's declaration order."
+        ),
+    )
+
 
 class ConflictResolution(BaseModel):
     """One adjudication: which side wins at a reported conflict."""
@@ -103,6 +168,24 @@ class MergeRequest(BaseModel):
             "detection and 'conflictResolutions' always use the original "
             "values. Malformed or duplicate pointers are rejected with "
             "HTTP 400."
+        ),
+    )
+    check_rules: list[CheckRule] = Field(
+        default_factory=list,
+        alias="checkRules",
+        description=(
+            "Optional regression checks over the final 'merged' document. "
+            "Each rule constrains which named direct child fields may "
+            "coexist at the objects reached by 'scope' (RFC 6901; a single "
+            "'*' token matches one object key, never an array index): "
+            "'all_or_none' requires every named field or none, 'at_most_one' "
+            "at most one. Carrying a member counts as present, even when its "
+            "value is null. Rules are evaluated in both 'base' and "
+            "'merged' and aligned by rule and concrete scope pointer, so "
+            "only violations newly introduced by the merge are reported; a "
+            "violation already present in base, or a scope deleted from "
+            "merged, is not reported. Malformed scope pointers or invalid "
+            "field lists are rejected with HTTP 400."
         ),
     )
     include_provenance: bool = Field(
@@ -251,5 +334,18 @@ class MergeResponse(BaseModel):
             "wholesale, and JSON Pointer tokens follow RFC 6901 escaping. "
             "Absent entirely from the response when the patch was not "
             "requested."
+        ),
+    )
+    violations: Optional[list[Violation]] = Field(
+        default=None,
+        description=(
+            "Present only when the request carried checkRules. The "
+            "checkRules violations newly introduced by 'merged': each entry "
+            "gives the zero-based rule index ('ruleIndex'), the concrete "
+            "scope pointer after wildcard expansion, and the named fields "
+            "actually present there. Violations already present in base "
+            "and scopes deleted from merged are not reported. Sorted by "
+            "'ruleIndex' then scope pointer. Absent entirely from the "
+            "response when no rules were supplied."
         ),
     )

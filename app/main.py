@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .checks import compile_check_rules, evaluate_check_rules
 from .merger import Merger, parse_pointer
 from .middleware import RequestSizeLimitMiddleware
 from .models import (
@@ -13,6 +14,7 @@ from .models import (
     MergeRequest,
     MergeResponse,
     ProvenanceEntry,
+    Violation,
 )
 from .patch import build_json_patch
 
@@ -45,10 +47,17 @@ app = FastAPI(
         "'base' into the response 'merged' when applied in order: object "
         "differences are emitted recursively, arrays are replaced "
         "wholesale, and reference tokens follow RFC 6901 escaping. "
+        "With 'checkRules' the response additionally carries a "
+        "'violations' array of coexistence checks ('all_or_none' or "
+        "'at_most_one' over named direct child fields) at object scopes "
+        "named by RFC 6901 pointers, where a single '*' token matches one "
+        "object key; rules are evaluated in both base and the final "
+        "merged document and only merged-introduced violations are "
+        "reported. "
         "Without redaction the response conflicts always keep the original "
         "three-way values."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -115,6 +124,14 @@ async def merge(request: MergeRequest):
             )
         redact_seen.add(tokens)
 
+    # checkRules scopes must be well-formed and each rule's field list valid
+    # (at least two distinct names). Pydantic already guarantees the request
+    # types, so the remaining rejections are business-level 400s.
+    try:
+        check_specs = compile_check_rules(request.check_rules)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         merger = Merger(
             request.array_identity, request.protected_paths, request.redact_paths
@@ -179,6 +196,23 @@ async def merge(request: MergeRequest):
         for record in raw_provenance
     ] if request.include_provenance else None
 
+    # Regression checks run on the final adjudicated merged document and are
+    # aligned with base per concrete scope pointer, so only merged-introduced
+    # violations remain.
+    raw_violations = (
+        evaluate_check_rules(request.base, merged, check_specs)
+        if check_specs
+        else None
+    )
+    violations = [
+        Violation(
+            rule_index=entry.rule_index,
+            scope=entry.scope,
+            fields=entry.fields,
+        )
+        for entry in raw_violations
+    ] if raw_violations is not None else None
+
     # Serialize directly: with the optional toggles off the response must be
     # byte-for-byte the old two-key envelope (no "provenance": null /
     # "patch": null), while an enabled request always includes the matching
@@ -191,4 +225,6 @@ async def merge(request: MergeRequest):
         body["provenance"] = [entry.model_dump() for entry in provenance]
     if request.include_patch:
         body["patch"] = build_json_patch(request.base, merged)
+    if violations is not None:
+        body["violations"] = [entry.model_dump(by_alias=True) for entry in violations]
     return JSONResponse(body)

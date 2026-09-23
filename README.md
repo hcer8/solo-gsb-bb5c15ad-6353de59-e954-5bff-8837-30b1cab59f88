@@ -337,6 +337,82 @@ curl -s -X POST http://localhost:8000/merge \
 {"op": "remove", "path": "/old"}
 ```
 
+### 约束回归检查（checkRules）
+
+合并审阅还可能需要校验：某些字段组合（如互斥开关、要么全配要么都不配的一组参数）**不能被本次合并新引入**。
+请求可携带可选的 `checkRules`（也接受别名 `check_rules`）规则数组，每条规则包含三个字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `scope` | 被检查对象的 [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901.html) 指针。单段 `*` **仅匹配单层对象键**（不匹配数组下标）；`*` 出现在指针的任意层级时，规则会在对象上展开为所有具体作用域指针。空字符串 `""` 表示根文档对象。 |
+| `fields` | 作用域对象的**直接子字段名**，至少两个且互不重复。对象携带该成员即视为“存在”——即使值是 JSON `null` 也算存在。 |
+| `mode` | `all_or_none`：这些字段**要么全有、要么全无**（只出现一部分即违规）；`at_most_one`：**最多只能出现一个**（出现两个及以上即违规）。 |
+
+**只报告 merged 新出现的违规（回归检查）**：每条规则分别在请求 `base` 与裁决后的最终 `merged`
+中展开对象作用域，按“规则 + 实际作用域指针”对齐比较——
+
+- 仅当某具体作用域在 **merged 中违规、在 base 中不违规** 时，才出现在响应 `violations` 中；
+- base 中**原本就存在**的违规即使持续存在（含字段值被修改）也不报告；合并把违规修正好了自然也不报告；
+- 作用域被**删除**、或该位置在 merged 中不再是对象（变成标量 / 数组）时，不报告；
+- 合并把原本合规的对象改成不合规（含经 `conflictResolutions` 裁决后产生的结果）照常报告。
+
+检查在最终裁决结果上进行，不改变 `merged` 与 `conflicts`；它读取真实值，因此与
+`protectedPaths` / `redactPaths` / `includeProvenance` / `includePatch` 均可同时使用。
+携带规则（非空数组）时，响应在原有键之外**新增** `violations` 数组；不带规则时
+**响应格式完全不变**（不会出现 `"violations": null`，连键都不存在）。
+
+每条违规包含规则下标、展开后的具体作用域指针、以及该作用域下**实际存在的被检查字段**
+（按规则中 `fields` 的声明顺序）；整个数组先按 `ruleIndex`、再按作用域指针升序排列：
+
+```json
+{
+  "ruleIndex": 0,
+  "scope": "/servers/db",
+  "fields": ["host", "port"]
+}
+```
+
+示例（`at_most_one`：base 只有 `host`，left 单侧新增 `port`，合并后两者共存，构成新违规）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"cfg": {"host": "h"}},
+    "left":  {"cfg": {"host": "h", "port": 5432}},
+    "right": {"cfg": {"host": "h"}},
+    "checkRules": [
+      {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": {"cfg": {"host": "h", "port": 5432}},
+  "conflicts": [],
+  "violations": [
+    {"ruleIndex": 0, "scope": "/cfg", "fields": ["host", "port"]}
+  ]
+}
+```
+
+通配展开示例（`/services/*` 仅展开 `/services` 下的对象键，对数组不生效；数组需用具体下标如
+`/services/0` 定位到对象元素；转义遵循 RFC 6901）：
+
+```json
+"checkRules": [
+  {"scope": "/tenants/*/endpoints/*", "fields": ["ipv4", "ipv6"],
+   "mode": "all_or_none"}
+]
+```
+
+以下情况返回 **400**：`scope` 指针格式非法（不以 `/` 开头等）、`fields` 少于两个、或
+`fields` 内有重复字段名（错误信息带规则下标，如 `checkRules[1]`）。
+`mode` 取其他值、`fields` 元素不是字符串、规则不是对象或含多余字段时返回 422。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -361,7 +437,10 @@ curl -s -X POST http://localhost:8000/merge \
 开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）；
 `includePatch`（也接受别名 `include_patch`）为布尔值，可省略（默认 `false`），
 开启后响应额外返回一组按顺序把 `base` 变成 `merged` 的 RFC 6902 `patch` 操作
-（见“JSON Patch”一节），可与 `includeProvenance` 同时开启。
+（见“JSON Patch”一节），可与 `includeProvenance` 同时开启；
+`checkRules`（也接受别名 `check_rules`）为约束回归检查规则数组，可省略；
+携带非空规则时响应额外返回按 `ruleIndex` 及作用域指针排序的 `violations` 数组
+（见“约束回归检查”一节），不带规则时响应格式完全不变。
 
 请求：
 
@@ -548,6 +627,7 @@ pytest -q
 app/
   main.py         FastAPI 路由（/health、/merge）
   merger.py       三方合并引擎（JSON Pointer、身份数组、冲突建模）
+  checks.py       checkRules 约束回归检查（作用域展开、base/merged 对齐）
   patch.py        RFC 6902 JSON Patch 生成（对象递归、数组整体替换、token 转义）
   middleware.py   请求体大小上限 ASGI 中间件
   config.py       环境变量配置与大小解析

@@ -1477,6 +1477,522 @@ def test_patch_operation_shape_is_validated_in_schema():
     assert response_schema["required"] == ["merged", "conflicts"]
 
 
+# --------------------------------------------------------------- checkRules
+
+
+def test_check_rules_absent_from_response_by_default():
+    response = client.post(
+        "/merge",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1}},
+    )
+    assert response.status_code == 200
+    # The legacy envelope is unchanged: no violations key at all.
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_check_rules_empty_list_keeps_legacy_envelope():
+    response = client.post(
+        "/merge",
+        json={"base": {}, "left": {}, "right": {}, "checkRules": []},
+    )
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_check_rules_accepts_snake_case_alias():
+    payload = {
+        "base": {"o": {}},
+        "left": {"o": {"a": 1, "b": 2}},
+        "right": {"o": {}},
+        "check_rules": [
+            {"scope": "/o", "fields": ["a", "b"], "mode": "at_most_one"}
+        ],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    assert response.json()["violations"] == [
+        {"ruleIndex": 0, "scope": "/o", "fields": ["a", "b"]}
+    ]
+
+
+def test_at_most_one_reports_fresh_two_field_coexistence():
+    payload = {
+        "base": {"cfg": {"host": "h"}},
+        "left": {"cfg": {"host": "h", "port": 1}},
+        "right": {"cfg": {"host": "h"}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["host", "port"]}
+    ]
+
+
+def test_at_most_one_single_field_is_compliant():
+    payload = {
+        "base": {"cfg": {"host": "h"}},
+        "left": {"cfg": {"host": "h2"}},
+        "right": {"cfg": {"host": "h"}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+        ],
+    }
+    assert client.post("/merge", json=payload).json()["violations"] == []
+
+
+def test_all_or_none_requires_every_field_or_none():
+    payload = {
+        "base": {"cfg": {}},
+        "left": {"cfg": {"a": 1}},
+        "right": {"cfg": {}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["a", "b"], "mode": "all_or_none"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["a"]}
+    ]
+
+    # All fields appearing together is compliant...
+    payload["left"] = {"cfg": {"a": 1, "b": 2}}
+    assert client.post("/merge", json=payload).json()["violations"] == []
+    # ...and no fields at all is compliant.
+    payload["left"] = {"cfg": {}}
+    assert client.post("/merge", json=payload).json()["violations"] == []
+
+
+def test_check_rules_null_value_counts_as_present():
+    payload = {
+        "base": {"cfg": {}},
+        "left": {"cfg": {"a": None}},
+        "right": {"cfg": {}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["a", "b"], "mode": "all_or_none"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["a"]}
+    ]
+
+
+def test_check_rules_existing_violation_in_base_is_not_reported():
+    # base already carries both fields; the merge changes one value but the
+    # violation persists -- a regression check must stay silent.
+    payload = {
+        "base": {"cfg": {"host": "h", "port": 1}},
+        "left": {"cfg": {"host": "h", "port": 2}},
+        "right": {"cfg": {"host": "h", "port": 1}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == []
+
+
+def test_check_rules_violation_fixed_by_merge_is_not_reported():
+    payload = {
+        "base": {"cfg": {"host": "h", "port": 1}},
+        "left": {"cfg": {"host": "h"}},
+        "right": {"cfg": {"host": "h", "port": 1}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+        ],
+    }
+    assert client.post("/merge", json=payload).json()["violations"] == []
+
+
+def test_check_rules_deleted_scope_reports_nothing():
+    # One-sided deletion of /cfg is accepted; the scope no longer exists.
+    payload = {
+        "base": {"cfg": {"host": "h", "port": 1}},
+        "left": {},
+        "right": {"cfg": {"host": "h", "port": 1}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["host", "port"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body == {"merged": {}, "conflicts": [], "violations": []}
+
+
+def test_check_rules_scope_replaced_by_non_object_reports_nothing():
+    payload = {
+        "base": {"cfg": {"a": 1, "b": 2}},
+        "left": {"cfg": 5},  # one-sided type change is accepted automatically
+        "right": {"cfg": {"a": 1, "b": 2}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["a", "b"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    # /cfg is now a scalar, which has no direct child fields: no violation.
+    assert body["merged"] == {"cfg": 5}
+    assert body["violations"] == []
+
+
+def test_check_rules_missing_scope_reports_nothing():
+    payload = {
+        "base": {},
+        "left": {"unrelated": 1},
+        "right": {},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["a", "b"], "mode": "at_most_one"}
+        ],
+    }
+    assert client.post("/merge", json=payload).json()["violations"] == []
+
+
+def test_check_rules_wildcard_expands_object_keys_one_level():
+    payload = {
+        "base": {"services": {"x": {"h": 1}}},
+        "left": {
+            "services": {"x": {"h": 1}, "y": {"h": 1, "p": 2},
+                         "z": {"h": 3, "p": 4}}
+        },
+        "right": {"services": {"x": {"h": 1}}},
+        "checkRules": [
+            {"scope": "/services/*", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    # Pre-existing /services/x is compliant; the two new objects violate and
+    # are reported sorted by concrete scope pointer.
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/services/y", "fields": ["h", "p"]},
+        {"ruleIndex": 0, "scope": "/services/z", "fields": ["h", "p"]},
+    ]
+
+
+def test_check_rules_wildcard_does_not_match_array_indices():
+    payload = {
+        "base": {"services": [{"h": 1, "p": 2}]},
+        "left": {"services": [{"h": 1, "p": 2}]},
+        "right": {"services": [{"h": 1, "p": 2}]},
+        "checkRules": [
+            {"scope": "/services/*", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    assert client.post("/merge", json=payload).json()["violations"] == []
+
+
+def test_check_rules_literal_array_index_navigates_to_object_item():
+    payload = {
+        "base": {"services": [{"h": 1}]},
+        "left": {"services": [{"h": 1, "p": 2}]},
+        "right": {"services": [{"h": 1}]},
+        "checkRules": [
+            {"scope": "/services/0", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/services/0", "fields": ["h", "p"]}
+    ]
+
+
+def test_check_rules_identity_array_uses_concrete_final_pointers():
+    # One new identity item violates; the existing item does not. The
+    # identity array is merged per item but the check reads final pointers.
+    payload = {
+        "base": {"servers": [{"id": "a", "h": 1}]},
+        "left": {"servers": [
+            {"id": "a", "h": 1},
+            {"id": "b", "h": 2, "p": 3},
+        ]},
+        "right": {"servers": [{"id": "a", "h": 1}]},
+        "arrayIdentity": {"/servers": "id"},
+        "checkRules": [
+            {"scope": "/servers/*", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    # '*' matches object keys only, so it does not enumerate the array...
+    assert body["violations"] == []
+    # ...but a concrete final index reaches the new object item.
+    payload["checkRules"] = [
+        {"scope": "/servers/1", "fields": ["h", "p"], "mode": "at_most_one"}
+    ]
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/servers/1", "fields": ["h", "p"]}
+    ]
+
+
+def test_check_rules_wildcard_at_several_levels():
+    payload = {
+        "base": {"a": {"x": {"b": {"i": {"u": 1}}}}},
+        "left": {"a": {"x": {"b": {"i": {"u": 1, "v": 2}}}}},
+        "right": {"a": {"x": {"b": {"i": {"u": 1}}}}},
+        "checkRules": [
+            {"scope": "/a/*/b/*", "fields": ["u", "v"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/a/x/b/i", "fields": ["u", "v"]}
+    ]
+
+
+def test_check_rules_root_scope_targets_whole_document():
+    payload = {
+        "base": {},
+        "left": {"a": 1, "b": 2},
+        "right": {},
+        "checkRules": [
+            {"scope": "", "fields": ["a", "b", "c"], "mode": "all_or_none"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "", "fields": ["a", "b"]}
+    ]
+
+
+def test_check_rules_escaped_pointer_tokens_round_trip():
+    payload = {
+        "base": {"a/b": {"x": 1}},
+        "left": {"a/b": {"x": 1, "y": 2}},
+        "right": {"a/b": {"x": 1}},
+        "checkRules": [
+            {"scope": "/a~1b", "fields": ["x", "y"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/a~1b", "fields": ["x", "y"]}
+    ]
+
+
+def test_check_rules_violations_sorted_by_index_then_scope():
+    payload = {
+        "base": {"o": {"z": {}, "a": {}}},
+        "left": {"o": {"z": {"h": 1, "p": 2}, "a": {"h": 1, "p": 2}}},
+        "right": {"o": {"z": {}, "a": {}}},
+        "checkRules": [
+            {"scope": "/o/*", "fields": ["h", "p"], "mode": "at_most_one"},
+            {"scope": "/o/*", "fields": ["h", "p"], "mode": "at_most_one"},
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/o/a", "fields": ["h", "p"]},
+        {"ruleIndex": 0, "scope": "/o/z", "fields": ["h", "p"]},
+        {"ruleIndex": 1, "scope": "/o/a", "fields": ["h", "p"]},
+        {"ruleIndex": 1, "scope": "/o/z", "fields": ["h", "p"]},
+    ]
+
+
+def test_check_rules_fields_listed_in_declaration_order():
+    # Fields come back in the rule's declaration order, even though the
+    # underlying object stores them in a different order.
+    payload = {
+        "base": {"o": {}},
+        "left": {"o": {"z": 1, "a": 2, "m": 3}},
+        "right": {"o": {}},
+        "checkRules": [
+            {"scope": "/o", "fields": ["m", "a", "z"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/o", "fields": ["m", "a", "z"]}
+    ]
+
+
+def test_check_rules_run_after_conflict_adjudication():
+    # An unresolved both_modified conflict keeps base at /cfg/h; the
+    # right-only add of /cfg/p is accepted, introducing a fresh
+    # at_most_one violation on /cfg.
+    payload = {
+        "base": {"cfg": {"h": 1}},
+        "left": {"cfg": {"h": 9}},
+        "right": {"cfg": {"h": 8, "p": 2}},
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"cfg": {"h": 1, "p": 2}}
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["h", "p"]}
+    ]
+    # Adjudicating the same conflict changes merged but not the check: the
+    # evaluation uses the final adjudicated document.
+    payload["conflictResolutions"] = [
+        {"pointer": "/cfg/h", "resolution": "left"}
+    ]
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"cfg": {"h": 9, "p": 2}}
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["h", "p"]}
+    ]
+
+
+def test_check_rules_coexist_with_provenance_patch_and_redaction():
+    payload = {
+        "base": {"cfg": {"h": 1, "pw": "x"}},
+        "left": {"cfg": {"h": 1, "p": 2, "pw": "L"}},
+        "right": {"cfg": {"h": 1, "pw": "R"}},
+        "redactPaths": ["/cfg/pw"],
+        "includeProvenance": True,
+        "includePatch": True,
+        "checkRules": [
+            {"scope": "/cfg", "fields": ["h", "p"], "mode": "at_most_one"}
+        ],
+    }
+    body = client.post("/merge", json=payload).json()
+    assert set(body) == {"merged", "conflicts", "provenance", "patch",
+                        "violations"}
+    assert body["violations"] == [
+        {"ruleIndex": 0, "scope": "/cfg", "fields": ["h", "p"]}
+    ]
+    # The check reads real values; redaction only masks the conflicts.
+    assert body["merged"]["cfg"]["pw"] == "x"
+    assert apply_patch(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_check_rules_do_not_change_merged_or_conflicts():
+    payload = {
+        "base": {"cfg": {"h": 1}},
+        "left": {"cfg": {"h": 9}},
+        "right": {"cfg": {"h": 8, "p": 2}},
+    }
+    off = client.post("/merge", json=payload).json()
+    on = client.post("/merge", json={**payload, "checkRules": [
+        {"scope": "/cfg", "fields": ["h", "p"], "mode": "at_most_one"}
+    ]}).json()
+    assert on["merged"] == off["merged"]
+    assert on["conflicts"] == off["conflicts"]
+
+
+def test_invalid_check_rules_pointer_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "cfg", "fields": ["a", "b"], "mode": "at_most_one"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[0]" in response.json()["detail"]
+
+
+def test_check_rules_too_few_fields_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/cfg", "fields": ["a"], "mode": "at_most_one"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "at least two" in response.json()["detail"]
+
+
+def test_check_rules_duplicate_fields_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/cfg", "fields": ["a", "a"], "mode": "at_most_one"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "must not repeat" in response.json()["detail"]
+
+
+def test_check_rules_error_index_identifies_offending_rule():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/ok", "fields": ["a", "b"], "mode": "at_most_one"},
+                {"scope": "bad", "fields": ["a", "b"], "mode": "at_most_one"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "checkRules[1]" in response.json()["detail"]
+
+
+def test_check_rules_invalid_mode_returns_422():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/cfg", "fields": ["a", "b"], "mode": "sometimes"}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_check_rules_field_must_be_string():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/cfg", "fields": ["a", 1], "mode": "at_most_one"}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_check_rules_entry_must_be_object():
+    response = client.post(
+        "/merge",
+        json={"base": {}, "left": {}, "right": {}, "checkRules": [42]},
+    )
+    assert response.status_code == 422
+
+
+def test_check_rules_unknown_entry_field_returns_422():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {}, "right": {},
+            "checkRules": [
+                {"scope": "/cfg", "fields": ["a", "b"], "mode": "at_most_one",
+                 "note": "bogus"}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_check_rules_appear_in_openapi_schema():
+    schema = client.get("/openapi.json").json()
+    req_props = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "checkRules" in req_props
+    check_rule = schema["components"]["schemas"]["CheckRule"]
+    assert check_rule["required"] == ["scope", "fields", "mode"]
+    assert set(check_rule["properties"]["mode"]["enum"]) == {
+        "all_or_none", "at_most_one"
+    }
+    violation = schema["components"]["schemas"]["Violation"]
+    assert set(violation["properties"]) == {"ruleIndex", "scope", "fields"}
+    response_schema = schema["components"]["schemas"]["MergeResponse"]
+    assert "violations" not in response_schema["required"]
+    any_of = response_schema["properties"]["violations"]["anyOf"]
+    assert {"type": "null"} in any_of
+    assert any(spec.get("type") == "array" for spec in any_of)
+    assert response_schema["required"] == ["merged", "conflicts"]
+
+
 # ------------------------------------------------------------- size limiting
 
 
